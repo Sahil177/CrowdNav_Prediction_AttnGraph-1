@@ -120,6 +120,29 @@ class Agent(object):
     def get_velocity(self):
         return self.vx, self.vy
 
+    def get_scan(self, resolution, other_px, other_py):
+        # get vector between other and this
+        r = np.array([self.px - other_px, self.py - other_py])
+        # compute angle of vector
+        theta = np.arctan2(r[1], r[0])
+        # compute angles to each edge of agent from robot
+        dtheta = np.arcsin(self.radius / np.linalg.norm(r))
+        if np.isnan(theta):
+            theta = np.pi/4 
+        if np.isnan(dtheta):
+            dtheta = np.pi/4
+        max_theta = theta + dtheta
+        min_theta = theta - dtheta
+        # compute angles in range matching resolution constraint
+        angle_indexes = np.array(range(int(np.ceil(min_theta*resolution/(2*np.pi))), int(np.ceil(max_theta*resolution/(2*np.pi)))))
+        angles = angle_indexes * 2 * np.pi / resolution
+        # compute distances at each angle
+        distances = np.linalg.norm(r) / np.cos(np.abs(theta - angles))
+        # correct angle indexes to the range (0, resolution - 1)
+        angle_indexes = np.where(angle_indexes < 0, angle_indexes + resolution, angle_indexes)
+        # return dictionary of {indexes : distances}
+        return dict(zip(angle_indexes.tolist(), distances.tolist()))
+
 
     def set_velocity(self, velocity):
         self.vx = velocity[0]

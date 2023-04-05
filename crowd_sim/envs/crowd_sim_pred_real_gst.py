@@ -1,8 +1,17 @@
 import gym
 import numpy as np
+from dr_spaam.detector import Detector
+import cv2
+from scipy.spatial import distance
+from scipy.optimize import linear_sum_assignment
 
 from crowd_sim.envs.crowd_sim_pred import CrowdSimPred
+import matplotlib.pyplot as plt
 
+
+
+# dr_model_file = 'trained_models/ckpt_jrdb_ann_ft_dr_spaam_e20.pth'
+dr_model_file = 'trained_models_lidar/ckpt_jrdb_ann_drow3_e40.pth'
 
 class CrowdSimPredRealGST(CrowdSimPred):
     '''
@@ -22,6 +31,134 @@ class CrowdSimPredRealGST(CrowdSimPred):
 
         # to receive data from gst pred model
         self.gst_out_traj = None
+
+        #lidar params 
+        self.lidar_fov = 360
+        self.scan_points = 450
+        self.lidar_resolution = np.deg2rad(self.lidar_fov/self.scan_points)
+        self.detector = Detector(dr_model_file, model='DROW3',gpu=True,stride=1,panoramic_scan=True)
+        self.detector.set_laser_fov(self.lidar_fov)
+        self.detections = []
+        self.use_detections = True
+        self.add_noise = False
+        self.scans = []
+        self.detections_xy = []
+        self.noisy  = []
+
+    def scan_lidar(self, noise = 0.3):
+        # get scan as a dictionary {angle_index : distance}
+        res = self.scan_points
+        full_scan = {}
+        for h in self.humans:
+            scan = h.get_scan(res, self.robot.px, self.robot.py)
+            for angle in scan:
+                if scan[angle] < full_scan.get(angle, np.inf):
+                    full_scan[angle] = scan[angle]
+
+        # convert to array of length res, with inf at angles with no reading
+        out_scan = np.zeros(res) + np.inf
+        for k in full_scan.keys():
+            out_scan[k] = full_scan[k]
+
+        out_scan = out_scan + noise*np.random.random(len(out_scan)) - 0.2
+        dim = 6
+        x = self.robot.px
+        y = self.robot.py
+        theta1 = np.arctan((dim-y)/(dim-x))
+        theta2 = np.pi - np.arctan((dim-y)/(dim+x))
+        theta3 = 1.5*np.pi - np.arctan((dim+x)/(dim+y))
+        theta4 = 1.5*np.pi + np.arctan((dim-x)/(dim+y))
+
+        for i in range(res):
+            if out_scan[i] == np.inf:
+                out_scan[i] = 200 # todo: maybe add some rigour here
+        return out_scan
+        
+    def find_assignment(self, prev_dets_xy, dets_xy):
+
+        # use hungarian algorithm to find correspondences between current and previous detections
+        n = self.human_num
+        m = len(dets_xy)
+        if m > n: raise ValueError("Number of detections must not be greater than the number of humans")
+        
+        # compute cost matrix
+        costs = np.zeros((n, m))
+    
+        for i in range(n):
+            for j in range(m):
+                dist = distance.euclidean(prev_dets_xy[i], dets_xy[j])
+                costs[i][j] = dist
+
+        # compute optimal assignments
+        row_ind, col_ind = linear_sum_assignment(costs)
+
+        return row_ind, col_ind
+    
+    def get_detections(self, scan):
+        # get people detections (positions)
+        full_dets_xy, dets_cls, instance_mask = self.detect(scan) 
+        # print(len(full_dets_xy))
+
+        # determine most likely detections 
+        detect_idx = np.argsort(dets_cls)
+        dets_xy = full_dets_xy[detect_idx]
+        if len(dets_xy) > self.human_num: dets_xy = dets_xy[-self.human_num:]
+
+        # process detections
+        robot_positions = [self.robot.px, self.robot.py]
+        dets_xy *= -1
+        dets_xy += robot_positions[-1]
+
+        # flag for detections < human_num in first step
+        if len(self.detections) == 0:
+            self.max_detections = len(dets_xy)
+        else:
+            self.max_detections = max(self.max_detections, len(dets_xy))
+
+        if self.max_detections < self.human_num:
+            for i in range(self.human_num - self.max_detections):
+                dets_xy = np.append(dets_xy, [dets_xy[-1]], axis=0)
+
+
+        if len(self.detections) > 0: # beyond first pass - match to previous detections
+            # get previous set of detections
+            prev_dets_xy = self.detections[-1]
+
+            # compute assignments and changing of detection arrays
+            rows, cols = self.find_assignment(prev_dets_xy, dets_xy)
+            new_dets = np.zeros((self.human_num, 2))
+            for i in range(len(cols)):
+                new_dets[rows[i]] = dets_xy[cols[i]]
+            for i in list(set(range(self.human_num)) - set(rows)):
+                new_dets[i] = prev_dets_xy[i]
+
+            dets_xy = new_dets.copy()
+            
+
+        assert len(dets_xy) == len(self.humans)
+        self.detections.append(dets_xy)
+
+        for i, pos in enumerate(dets_xy):
+            self.humans[i].set_detected_state(pos, self.step_counter)
+
+        return dets_xy
+
+    def detect(self, scan):
+        dets, dcls, mask = self.detector(scan)
+        del_mask = np.where(np.linalg.norm(dets, axis=-1) > 10, True, False)
+        dcls = np.delete(dcls, del_mask, axis=0)
+        dets = np.delete(dets, del_mask, axis=0)
+        # print(len(dets))
+            
+        return dets, dcls, mask
+    
+    def scan_to_points(self, scan):
+        coords = []
+        for i in range(len(scan)):
+            ang = 360*i/self.scan_points
+            coords.append([self.robot.px + scan[i]*np.cos(np.deg2rad(ang)), self.robot.py + scan[i]*np.sin(np.deg2rad(ang))])
+
+        return coords
 
 
     def set_robot(self, robot):
@@ -90,6 +227,20 @@ class CrowdSimPredRealGST(CrowdSimPred):
         ob['spatial_edges'] = np.tile(parent_ob['spatial_edges'], self.predict_steps+1)
 
         ob['detected_human_num'] = parent_ob['detected_human_num']
+
+        # Use scan for observation 
+        scan = self.scan_lidar()
+        self.scans.append(scan)
+        detection_xy = self.get_detections(scan)
+        self.detections_xy.append(detection_xy)
+
+        if self.use_detections:
+            ob['spatial_edges'][:,:2] = detection_xy
+        elif self.add_noise:
+            ob_noise = ob['spatial_edges'][:,:2] + 0.2*np.random.randn(self.human_num, 2) 
+            ob['spatial_edges'][:,:2] = ob_noise
+            self.noisy.append(ob_noise)
+
 
         return ob
 
@@ -165,7 +316,45 @@ class CrowdSimPredRealGST(CrowdSimPred):
         for arrow in arrows:
             ax.add_artist(arrow)
             artists.append(arrow)
+        
+        # add lidar scans 
+        scan_xy = self.scan_to_points(self.scans[-1])
+        xs = [scan_xy[i][0] for i in range(len(scan_xy))]
+        ys = [scan_xy[i][1] for i in range(len(scan_xy))]
+        
+        scatter = ax.scatter(xs, ys, c ='b', s=6)
 
+        # add detections
+        if self.use_detections:
+            detection_xy = self.detections_xy[self.step_counter]
+            # detection_xy = np.array([[human.detector_px, human.detector_py] for human in self.humans]) 
+        elif self.add_noise:
+            detection_xy = self.noisy[-1]
+        else:
+            detection_xy = np.array([[human.px, human.py] for human in self.humans]) 
+
+
+        # detection_xy = np.array([[human.px, human.py] for human in self.humans]) # + 0.3*np.random.random((self.human_num, 2))
+        # detection_xy = self.detections[-1]
+
+        xs = [detection_xy[i][0] for i in range(len(detection_xy))]
+        ys = [detection_xy[i][1] for i in range(len(detection_xy))]
+
+        scatter2 = ax.scatter(xs, ys, c='r', s=70, edgecolors='k')
+
+        # add detection labels
+        alph = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+        det_human_numbers = [
+            plt.text(detection_xy[i][0] +.5,
+                    detection_xy[i][1]  + .5,
+                    str(alph[i]),
+                    color='r',
+                    fontsize=12) for i in range(len(detection_xy))
+        ]
+
+        for i in range(len(det_human_numbers)):
+            ax.add_artist(det_human_numbers[i])
 
         # draw FOV for the robot
         # add robot FOV
@@ -238,5 +427,7 @@ class CrowdSimPredRealGST(CrowdSimPred):
         for item in artists:
             item.remove() # there should be a better way to do this. For example,
             # initially use add_artist and draw_artist later on
+        scatter.remove()
+        scatter2.remove()
         for t in ax.texts:
             t.set_visible(False)

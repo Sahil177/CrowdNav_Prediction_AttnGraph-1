@@ -70,6 +70,9 @@ class CrowdSimVarNum(CrowdSim):
             for i in range(self.max_human_num):
                 human = Human(self.config, 'humans')
                 human.set(15, 15, 15, 15, 0, 0, 0)
+                human.detector_px = human.px
+                human.detector_py = human.py
+                human.set_detected_state([human.px, human.py], self.agent_timestep)
                 human.isObstacle = True
                 self.humans.append(human)
 
@@ -142,6 +145,9 @@ class CrowdSimVarNum(CrowdSim):
                 break
 
         human.set(px, py, -px, -py, 0, 0, 0)
+        human.detector_px = px
+        human.detector_py = py
+        human.set_detected_state([px, py], self.step_counter)
 
         return human
 

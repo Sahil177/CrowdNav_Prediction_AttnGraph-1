@@ -9,6 +9,9 @@ legends = ['Non-randomized humans', 'randomized humans', '', '', '']
 log_list = [
 pd.read_csv("trained_models/GST_predictor_non_rand/progress.csv"),
 pd.read_csv("trained_models/GST_predictor_rand/progress.csv"),
+pd.read_csv("trained_models/my_finetune/progress.csv"),
+pd.read_csv("trained_models/my_model/progress.csv"),
+pd.read_csv("trained_models/finetune2/progress.csv")
 	]
 
 
